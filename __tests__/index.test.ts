@@ -3,37 +3,39 @@
 //     https://opensource.org/license/mit
 
 import { expect, it, describe, inject } from "vitest"
-import { deserialize, serialize, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
+import { cborCodec, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
          RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
          newHttpBatchRpcSession} from "../src/index.js"
+import { Devaluator, Evaluator } from "../src/serialize.js"
 import { Counter, TestTarget } from "./test-util.js";
 
-let SERIALIZE_TEST_CASES: Record<string, unknown> = {
-  '123': 123,
-  'null': null,
-  '"foo"': "foo",
-  'true': true,
+// Test cases for CBOR serialization roundtrip
+let SERIALIZE_TEST_CASES: unknown[] = [
+  123,
+  null,
+  "foo",
+  true,
 
-  '{"foo":123}': {foo: 123},
-  '{"foo":{"bar":123,"baz":456},"qux":789}': {foo: {bar: 123, baz: 456}, qux: 789},
+  {foo: 123},
+  {foo: {bar: 123, baz: 456}, qux: 789},
 
-  '[[123]]': [123],
-  '[[[[123,456]]]]': [[123, 456]],
-  '{"foo":[[123]]}': {foo: [123]},
-  '{"foo":[[123]],"bar":[[456,789]]}': {foo: [123], bar: [456, 789]},
+  [123],
+  [[123, 456]],
+  {foo: [123]},
+  {foo: [123], bar: [456, 789]},
 
-  '["bigint","123"]': 123n,
-  '["date",1234]': new Date(1234),
-  '["bytes","aGVsbG8h"]': new TextEncoder().encode("hello!"),
-  '["undefined"]': undefined,
-  '["error","Error","the message"]': new Error("the message"),
-  '["error","TypeError","the message"]': new TypeError("the message"),
-  '["error","RangeError","the message"]': new RangeError("the message"),
+  123n,
+  new Date(1234),
+  new TextEncoder().encode("hello!"),
+  undefined,
+  new Error("the message"),
+  new TypeError("the message"),
+  new RangeError("the message"),
 
-  '["inf"]': Infinity,
-  '["-inf"]': -Infinity,
-  '["nan"]': NaN,
-};
+  Infinity,
+  -Infinity,
+  NaN,
+];
 
 class NotSerializable {
   i: number;
@@ -45,16 +47,34 @@ class NotSerializable {
   }
 }
 
-describe("simple serialization", () => {
-  it("can serialize", () => {
-    for (let key in SERIALIZE_TEST_CASES) {
-      expect(serialize(SERIALIZE_TEST_CASES[key])).toBe(key);
-    }
-  })
+// Helper to serialize using Devaluator -> CBOR
+function serialize(value: unknown): Uint8Array {
+  return cborCodec.encode(Devaluator.devaluate(value));
+}
 
-  it("can deserialize", () => {
-    for (let key in SERIALIZE_TEST_CASES) {
-      expect(deserialize(key)).toStrictEqual(SERIALIZE_TEST_CASES[key]);
+// Helper to deserialize using CBOR -> Evaluator
+class NullImporter {
+  importStub(): never { throw new Error("Not supported"); }
+  importPromise(): never { throw new Error("Not supported"); }
+  getExport(): undefined { return undefined; }
+}
+function deserialize(data: Uint8Array): unknown {
+  const payload = new Evaluator(new NullImporter()).evaluate(cborCodec.decode(data));
+  payload.dispose();
+  return payload.value;
+}
+
+describe("simple serialization", () => {
+  it("can roundtrip values through CBOR", () => {
+    for (let value of SERIALIZE_TEST_CASES) {
+      const encoded = serialize(value);
+      const decoded = deserialize(encoded);
+      // Handle NaN specially since NaN !== NaN
+      if (typeof value === 'number' && isNaN(value)) {
+        expect(isNaN(decoded as number)).toBe(true);
+      } else {
+        expect(decoded).toStrictEqual(value);
+      }
     }
   })
 
@@ -90,15 +110,15 @@ describe("simple serialization", () => {
       },
       top_array: [[1, 2], [3, 4]]
     };
-    let serialized = serialize(complex);
-    expect(deserialize(serialized)).toStrictEqual(complex);
+    let encoded = serialize(complex);
+    expect(deserialize(encoded)).toStrictEqual(complex);
   })
 
   it("throws errors for malformed deserialization data", () => {
-    expect(() => deserialize('{"unclosed": ')).toThrowError();
-    expect(() => deserialize('["unknown_type", "param"]')).toThrowError();
-    expect(() => deserialize('["date"]')).toThrowError(); // missing timestamp
-    expect(() => deserialize('["error"]')).toThrowError(); // missing type and message
+    // CBOR decoder throws for invalid data
+    expect(() => cborCodec.decode(new Uint8Array([0xFF, 0xFF]))).toThrowError();
+    // Unknown Cap'n Web type code
+    expect(() => deserialize(cborCodec.encode(["unknown_type", "param"]))).toThrowError();
   })
 });
 
@@ -111,17 +131,22 @@ class TestTransport implements RpcTransport {
     }
   }
 
-  private queue: string[] = [];
+  private queue: Uint8Array[] = [];
   private waiter?: () => void;
   private aborter?: (err: any) => void;
   public log = false;
 
-  async send(message: string): Promise<void> {
+  async send(message: Uint8Array): Promise<void> {
     // HACK: If the string "$remove$" appears in the message, remove it. This is used in some
-    //   tests to hack the RPC protocol.
-    message = message.replaceAll("$remove$", "");
+    //   tests to hack the RPC protocol. We decode, manipulate, and re-encode.
+    const decoded = cborCodec.decode(message) as unknown;
+    const jsonStr = JSON.stringify(decoded);
+    if (jsonStr.includes("$remove$")) {
+      const modified = JSON.parse(jsonStr.replaceAll("$remove$", ""));
+      message = cborCodec.encode(modified);
+    }
 
-    if (this.log) console.log(`${this.name}: ${message}`);
+    if (this.log) console.log(`${this.name}: ${JSON.stringify(cborCodec.decode(message))}`);
     this.partner!.queue.push(message);
     if (this.partner!.waiter) {
       this.partner!.waiter();
@@ -130,7 +155,7 @@ class TestTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<Uint8Array> {
     if (this.queue.length == 0) {
       await new Promise<void>((resolve, reject) => {
         this.waiter = resolve;

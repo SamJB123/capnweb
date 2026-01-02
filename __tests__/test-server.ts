@@ -30,6 +30,17 @@ export async function setup(project: TestProject) {
       return;
     }
 
+    // Handle CORS preflight requests
+    if (request.method === 'OPTIONS') {
+      response.writeHead(204, {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type",
+      });
+      response.end();
+      return;
+    }
+
     // Here we're just routing all requests to RPC, but normally you'd do some routing on
     // request.url and then call this only for your API route.
     nodeHttpBatchRpcResponse(request, response, new TestTarget(), {
@@ -51,14 +62,14 @@ export async function setup(project: TestProject) {
   })
 
   // Listen on an ephemeral port for testing purposes.
-  httpServer.listen(0);
+  // Bind to localhost explicitly so browsers can connect.
+  await new Promise<void>((resolve) => {
+    httpServer!.listen(0, 'localhost', () => resolve());
+  });
   let addr = httpServer.address() as AddressInfo;
 
   // Provide the server address to tests.
-  //
-  // We use the Node-specific `url.format` here because it automatically handles adding brackets to
-  // IPv6 addresses. Unfortunately, the standard `URL` class doesn't seem to provide this.
-  project.provide("testServerHost", url.format({hostname: addr.address, port: addr.port}));
+  project.provide("testServerHost", `localhost:${addr.port}`);
 }
 
 export async function teardown() {

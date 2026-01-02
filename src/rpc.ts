@@ -3,7 +3,8 @@
 //     https://opensource.org/license/mit
 
 import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath } from "./core.js";
-import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer, serialize } from "./serialize.js";
+import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer } from "./serialize.js";
+import { cborCodec } from "./codec.js";
 
 /**
  * Interface for an RPC transport, which is a simple bidirectional message stream. Implement this
@@ -13,7 +14,7 @@ export interface RpcTransport {
   /**
    * Sends a message to the other end.
    */
-  send(message: string): Promise<void>;
+  send(message: Uint8Array): Promise<void>;
 
   /**
    * Receives a message sent by the other end.
@@ -23,7 +24,7 @@ export interface RpcTransport {
    * If there are no outstanding calls (and none are made in the future), then the error does not
    * propagate anywhere -- this is considered a "clean" shutdown.
    */
-  receive(): Promise<string>;
+  receive(): Promise<Uint8Array>;
 
   /**
    * Indicates that the RPC system has suffered an error that prevents the session from continuing.
@@ -511,17 +512,17 @@ class RpcSessionImpl implements Importer, Exporter {
       return;
     }
 
-    let msgText: string;
+    let msgData: Uint8Array;
     try {
-      msgText = JSON.stringify(msg);
+      msgData = cborCodec.encode(msg);
     } catch (err) {
-      // If JSON stringification failed, there's something wrong with the devaluator, as it should
-      // not allow non-JSONable values to be injected in the first place.
+      // If CBOR encoding failed, there's something wrong with the devaluator, as it should
+      // not allow non-encodable values to be injected in the first place.
       try { this.abort(err); } catch (err2) {}
       throw err;
     }
 
-    this.transport.send(msgText)
+    this.transport.send(msgData)
         // If send fails, abort the connection, but don't try to send an abort message since
         // that'll probably also fail.
         .catch(err => this.abort(err, false));
@@ -596,7 +597,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (trySendAbortMessage) {
       try {
-        this.transport.send(JSON.stringify(["abort", Devaluator
+        this.transport.send(cborCodec.encode(["abort", Devaluator
             .devaluate(error, undefined, this)]))
             .catch(err => {});
       } catch (err) {
@@ -644,7 +645,8 @@ class RpcSessionImpl implements Importer, Exporter {
 
   private async readLoop(abortPromise: Promise<never>) {
     while (!this.abortReason) {
-      let msg = JSON.parse(await Promise.race([this.transport.receive(), abortPromise]));
+      let msgData = await Promise.race([this.transport.receive(), abortPromise]);
+      let msg = cborCodec.decode(msgData);
       if (this.abortReason) break;  // check again before processing
 
       if (msg instanceof Array) {

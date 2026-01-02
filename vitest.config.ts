@@ -3,6 +3,7 @@
 //     https://opensource.org/license/mit
 
 import { defineConfig } from 'vitest/config'
+import { playwright } from '@vitest/browser-playwright'
 
 export default defineConfig({
   esbuild: {
@@ -26,39 +27,36 @@ export default defineConfig({
           name: 'workerd',
           include: ['__tests__/index.test.ts', '__tests__/workerd.test.ts'],
           pool: '@cloudflare/vitest-pool-workers',
-          poolOptions: {
-            workers: {
-              miniflare: {
-                compatibilityDate: '2025-07-01',
-                compatibilityFlags: ["expose_global_message_channel"],
+          // Vitest 4: poolOptions moved to top-level via pool-specific config
+          miniflare: {
+            compatibilityDate: '2025-07-01',
+            compatibilityFlags: ["expose_global_message_channel"],
 
-                // Define a backend worker to test server-side functionality. The tests will
-                // talk to it over a service binding. (Only the workerd client tests will talk
-                // to this, not Node nor browsers.)
-                serviceBindings: {
-                  testServer: "test-server-workerd",
-                },
-                workers: [
-                  {
-                    name: "test-server-workerd",
-                    compatibilityDate: '2025-07-01',
-                    modules: [
-                      {
-                        type: "ESModule",
-                        path: "./__tests__/test-server-workerd.js",
-                      },
-                      {
-                        type: "ESModule",
-                        path: "./dist/index-workers.js",
-                      },
-                    ],
-                    durableObjects: {
-                      TEST_DO: "TestDo"
-                    }
-                  }
-                ]
-              },
+            // Define a backend worker to test server-side functionality. The tests will
+            // talk to it over a service binding. (Only the workerd client tests will talk
+            // to this, not Node nor browsers.)
+            serviceBindings: {
+              testServer: "test-server-workerd",
             },
+            workers: [
+              {
+                name: "test-server-workerd",
+                compatibilityDate: '2025-07-01',
+                modules: [
+                  {
+                    type: "ESModule",
+                    path: "./__tests__/test-server-workerd.js",
+                  },
+                  {
+                    type: "ESModule",
+                    path: "./dist/index-workers.js",
+                  },
+                ],
+                durableObjects: {
+                  TEST_DO: "TestDo"
+                }
+              }
+            ]
           },
         },
       },
@@ -70,7 +68,7 @@ export default defineConfig({
           include: ['__tests__/index.test.ts'],
           browser: {
             enabled: true,
-            provider: 'playwright',
+            provider: playwright(),
             instances: [
               // Currently only Chromium supports this.
               { browser: 'chromium' },
@@ -91,7 +89,7 @@ export default defineConfig({
           include: ['__tests__/index.test.ts'],
           browser: {
             enabled: true,
-            provider: 'playwright',
+            provider: playwright(),
             instances: [
               // We re-test Chromium in this mode since it's likely users will want to serve the
               // same JavaScript to all browsers, so will have to use this mode until `using`

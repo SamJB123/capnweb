@@ -29,7 +29,16 @@ class MessagePortTransport implements RpcTransport {
       } else if (event.data === null) {
         // Peer is signaling that they're closing the connection
         this.#receivedError(new Error("Peer closed MessagePort connection."));
-      } else if (typeof event.data === "string") {
+      } else if (event.data instanceof ArrayBuffer) {
+        const message = new Uint8Array(event.data);
+        if (this.#receiveResolver) {
+          this.#receiveResolver(message);
+          this.#receiveResolver = undefined;
+          this.#receiveRejecter = undefined;
+        } else {
+          this.#receiveQueue.push(message);
+        }
+      } else if (event.data instanceof Uint8Array) {
         if (this.#receiveResolver) {
           this.#receiveResolver(event.data);
           this.#receiveResolver = undefined;
@@ -38,7 +47,7 @@ class MessagePortTransport implements RpcTransport {
           this.#receiveQueue.push(event.data);
         }
       } else {
-        this.#receivedError(new TypeError("Received non-string message from MessagePort."));
+        this.#receivedError(new TypeError("Received non-binary message from MessagePort."));
       }
     });
 
@@ -48,25 +57,26 @@ class MessagePortTransport implements RpcTransport {
   }
 
   #port: MessagePort;
-  #receiveResolver?: (message: string) => void;
+  #receiveResolver?: (message: Uint8Array) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: string[] = [];
+  #receiveQueue: Uint8Array[] = [];
   #error?: any;
 
-  async send(message: string): Promise<void> {
+  async send(message: Uint8Array): Promise<void> {
     if (this.#error) {
       throw this.#error;
     }
-    this.#port.postMessage(message);
+    // Transfer the buffer for zero-copy send
+    this.#port.postMessage(message, [message.buffer]);
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<Uint8Array> {
     if (this.#receiveQueue.length > 0) {
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
     } else {
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<Uint8Array>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });

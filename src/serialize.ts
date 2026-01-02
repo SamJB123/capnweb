@@ -44,25 +44,10 @@ const ERROR_TYPES: Record<string, any> = {
   // TODO: DOMError? Others?
 };
 
-// Polyfill type for UInt8Array.toBase64(), which has started landing in JS runtimes but is not
-// supported everywhere just yet.
-interface Uint8Array {
-  toBase64?(options?: {
-    alphabet?: "base64" | "base64url",
-    omitPadding?: boolean
-  }): string;
-};
 
-interface FromBase64 {
-  fromBase64?(text: string, options?: {
-    alphabet?: "base64" | "base64url",
-    lastChunkHandling?: "loose" | "strict" | "stop-before-partial"
-  }): Uint8Array;
-}
-
-// Converts fully-hydrated messages into object trees that are JSON-serializable for sending over
+// Converts fully-hydrated messages into object trees that can be CBOR-encoded for sending over
 // the wire. This is used to implement serialization -- but it doesn't take the last step of
-// actually converting to a string. (The name is meant to be the opposite of "Evaluator", which
+// actually encoding to bytes. (The name is meant to be the opposite of "Evaluator", which
 // implements the opposite direction.)
 export class Devaluator {
   private constructor(private exporter: Exporter, private source: RpcPayload | undefined) {}
@@ -154,13 +139,8 @@ export class Devaluator {
         return ["date", (<Date>value).getTime()];
 
       case "bytes": {
-        let bytes = value as Uint8Array;
-        if (bytes.toBase64) {
-          return ["bytes", bytes.toBase64({omitPadding: true})];
-        } else {
-          return ["bytes",
-              btoa(String.fromCharCode.apply(null, bytes as number[]).replace(/=*$/, ""))];
-        }
+        // Pass Uint8Array directly - CBOR handles it natively
+        return ["bytes", value as Uint8Array];
       }
 
       case "error": {
@@ -250,13 +230,8 @@ export class Devaluator {
   }
 }
 
-/**
- * Serialize a value, using Cap'n Web's underlying serialization. This won't be able to serialize
- * RPC stubs, but it will support basic data types.
- */
-export function serialize(value: unknown): string {
-  return JSON.stringify(Devaluator.devaluate(value));
-}
+// Note: The serialize() function has been removed. Use cborCodec.encode(Devaluator.devaluate(value))
+// for standalone serialization if needed.
 
 // =======================================================================================
 
@@ -326,19 +301,9 @@ export class Evaluator {
           }
           break;
         case "bytes": {
-          let b64 = Uint8Array as FromBase64;
-          if (typeof value[1] == "string") {
-            if (b64.fromBase64) {
-              return b64.fromBase64(value[1]);
-            } else {
-              let bs = atob(value[1]);
-              let len = bs.length;
-              let bytes = new Uint8Array(len);
-              for (let i = 0; i < len; i++) {
-                bytes[i] = bs.charCodeAt(i);
-              }
-              return bytes;
-            }
+          // CBOR decodes Uint8Array directly
+          if (value[1] instanceof Uint8Array) {
+            return value[1];
           }
           break;
         }
@@ -540,17 +505,11 @@ export class Evaluator {
       }
       return result;
     } else {
-      // Other JSON types just pass through.
+      // Primitives (null, boolean, number, string) pass through.
       return value;
     }
   }
 }
 
-/**
- * Deserialize a value serialized using serialize().
- */
-export function deserialize(value: string): unknown {
-  let payload = new Evaluator(NULL_IMPORTER).evaluate(JSON.parse(value));
-  payload.dispose();  // should be no-op but just in case
-  return payload.value;
-}
+// Note: The deserialize() function has been removed. Use
+// new Evaluator(NULL_IMPORTER).evaluate(cborCodec.decode(data)) for standalone deserialization.

@@ -6,7 +6,49 @@ import { RpcStub } from "./core.js";
 import { RpcTransport, RpcSession, RpcSessionOptions } from "./rpc.js";
 import type { IncomingMessage, ServerResponse, OutgoingHttpHeader, OutgoingHttpHeaders } from "node:http";
 
-type SendBatchFunc = (batch: string[]) => Promise<string[]>;
+type SendBatchFunc = (batch: Uint8Array[]) => Promise<Uint8Array[]>;
+
+/**
+ * Encode multiple binary messages into a single buffer using length-prefixed framing.
+ * Format: [4-byte length][message bytes][4-byte length][message bytes]...
+ */
+function encodeBatch(messages: Uint8Array[]): Uint8Array {
+  let totalLength = 0;
+  for (const msg of messages) {
+    totalLength += 4 + msg.length;  // 4 bytes for length prefix
+  }
+
+  const result = new Uint8Array(totalLength);
+  const view = new DataView(result.buffer);
+  let offset = 0;
+
+  for (const msg of messages) {
+    view.setUint32(offset, msg.length, false);  // big-endian
+    offset += 4;
+    result.set(msg, offset);
+    offset += msg.length;
+  }
+
+  return result;
+}
+
+/**
+ * Decode a length-prefixed buffer back into individual messages.
+ */
+function decodeBatch(data: Uint8Array): Uint8Array[] {
+  const messages: Uint8Array[] = [];
+  const view = new DataView(data.buffer, data.byteOffset, data.byteLength);
+  let offset = 0;
+
+  while (offset < data.length) {
+    const length = view.getUint32(offset, false);  // big-endian
+    offset += 4;
+    messages.push(data.slice(offset, offset + length));
+    offset += length;
+  }
+
+  return messages;
+}
 
 class BatchClientTransport implements RpcTransport {
   constructor(sendBatch: SendBatchFunc) {
@@ -16,10 +58,10 @@ class BatchClientTransport implements RpcTransport {
   #promise: Promise<void>;
   #aborted: any;
 
-  #batchToSend: string[] | null = [];
-  #batchToReceive: string[] | null = null;
+  #batchToSend: Uint8Array[] | null = [];
+  #batchToReceive: Uint8Array[] | null = null;
 
-  async send(message: string): Promise<void> {
+  async send(message: Uint8Array): Promise<void> {
     // If the batch was already sent, we just ignore the message, because throwing may cause the
     // RPC system to abort prematurely. Once the last receive() is done then we'll throw an error
     // that aborts the RPC system at the right time and will propagate to all other requests.
@@ -28,7 +70,7 @@ class BatchClientTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<Uint8Array> {
     if (!this.#batchToReceive) {
       await this.#promise;
     }
@@ -69,10 +111,15 @@ class BatchClientTransport implements RpcTransport {
 
 export function newHttpBatchRpcSession(
     urlOrRequest: string | Request, options?: RpcSessionOptions): RpcStub {
-  let sendBatch: SendBatchFunc = async (batch: string[]) => {
+  let sendBatch: SendBatchFunc = async (batch: Uint8Array[]) => {
+    const encoded = encodeBatch(batch);
     let response = await fetch(urlOrRequest, {
       method: "POST",
-      body: batch.join("\n"),
+      headers: {
+        "Content-Type": "application/octet-stream",
+      },
+      // Wrap in Blob for consistent BodyInit compatibility
+      body: new Blob([encoded as BlobPart]),
     });
 
     if (!response.ok) {
@@ -80,8 +127,8 @@ export function newHttpBatchRpcSession(
       throw new Error(`RPC request failed: ${response.status} ${response.statusText}`);
     }
 
-    let body = await response.text();
-    return body == "" ? [] : body.split("\n");
+    let body = new Uint8Array(await response.arrayBuffer());
+    return body.length === 0 ? [] : decodeBatch(body);
   };
 
   let transport = new BatchClientTransport(sendBatch);
@@ -90,19 +137,19 @@ export function newHttpBatchRpcSession(
 }
 
 class BatchServerTransport implements RpcTransport {
-  constructor(batch: string[]) {
+  constructor(batch: Uint8Array[]) {
     this.#batchToReceive = batch;
   }
 
-  #batchToSend: string[] = [];
-  #batchToReceive: string[];
+  #batchToSend: Uint8Array[] = [];
+  #batchToReceive: Uint8Array[];
   #allReceived: PromiseWithResolvers<void> = Promise.withResolvers<void>();
 
-  async send(message: string): Promise<void> {
+  async send(message: Uint8Array): Promise<void> {
     this.#batchToSend.push(message);
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<Uint8Array> {
     let msg = this.#batchToReceive!.shift();
     if (msg !== undefined) {
       return msg;
@@ -121,8 +168,8 @@ class BatchServerTransport implements RpcTransport {
     return this.#allReceived.promise;
   }
 
-  getResponseBody(): string {
-    return this.#batchToSend.join("\n");
+  getResponseBody(): Uint8Array {
+    return encodeBatch(this.#batchToSend);
   }
 }
 
@@ -142,8 +189,8 @@ export async function newHttpBatchRpcResponse(
     return new Response("This endpoint only accepts POST requests.", { status: 405 });
   }
 
-  let body = await request.text();
-  let batch = body === "" ? [] : body.split("\n");
+  let body = new Uint8Array(await request.arrayBuffer());
+  let batch = body.length === 0 ? [] : decodeBatch(body);
 
   let transport = new BatchServerTransport(batch);
   let rpc = new RpcSession(transport, localMain, options);
@@ -160,7 +207,9 @@ export async function newHttpBatchRpcResponse(
 
   // TODO: Ask RpcSession to dispose everything it is still holding on to?
 
-  return new Response(transport.getResponseBody());
+  return new Response(new Blob([transport.getResponseBody() as BlobPart]), {
+    headers: { "Content-Type": "application/octet-stream" },
+  });
 }
 
 /**
@@ -179,19 +228,21 @@ export async function nodeHttpBatchRpcResponse(
     }): Promise<void> {
   if (request.method !== "POST") {
     response.writeHead(405, "This endpoint only accepts POST requests.");
+    response.end();
+    return;
   }
 
-  let body = await new Promise<string>((resolve, reject) => {
+  let body = await new Promise<Uint8Array>((resolve, reject) => {
     let chunks: Buffer[] = [];
     request.on("data", chunk => {
       chunks.push(chunk);
     });
     request.on("end", () => {
-      resolve(Buffer.concat(chunks).toString());
+      resolve(new Uint8Array(Buffer.concat(chunks)));
     });
     request.on("error", reject);
   });
-  let batch = body === "" ? [] : body.split("\n");
+  let batch = body.length === 0 ? [] : decodeBatch(body);
 
   let transport = new BatchServerTransport(batch);
   let rpc = new RpcSession(transport, localMain, options);
@@ -199,6 +250,11 @@ export async function nodeHttpBatchRpcResponse(
   await transport.whenAllReceived();
   await rpc.drain();
 
-  response.writeHead(200, options?.headers);
-  response.end(transport.getResponseBody());
+  const headers = {
+    ...options?.headers,
+    "Content-Type": "application/octet-stream",
+  };
+  response.writeHead(200, headers);
+  const responseBody = transport.getResponseBody();
+  response.end(Buffer.from(responseBody.buffer, responseBody.byteOffset, responseBody.byteLength));
 }

@@ -42,6 +42,9 @@ class WebSocketTransport implements RpcTransport {
   constructor (webSocket: WebSocket) {
     this.#webSocket = webSocket;
 
+    // Ensure we receive ArrayBuffer instead of Blob for binary messages
+    webSocket.binaryType = 'arraybuffer';
+
     if (webSocket.readyState === WebSocket.CONNECTING) {
       this.#sendQueue = [];
       webSocket.addEventListener("open", event => {
@@ -59,16 +62,38 @@ class WebSocketTransport implements RpcTransport {
     webSocket.addEventListener("message", (event: MessageEvent<any>) => {
       if (this.#error) {
         // Ignore further messages.
-      } else if (typeof event.data === "string") {
-        if (this.#receiveResolver) {
-          this.#receiveResolver(event.data);
-          this.#receiveResolver = undefined;
-          this.#receiveRejecter = undefined;
-        } else {
-          this.#receiveQueue.push(event.data);
-        }
       } else {
-        this.#receivedError(new TypeError("Received non-string message from WebSocket."));
+        // Handle various binary message types:
+        // - ArrayBuffer (browser standard)
+        // - Uint8Array (both browser and Node)
+        // - Buffer (Node.js ws module)
+        // - ArrayBufferView (generic typed array)
+        let message: Uint8Array | undefined;
+        const data = event.data;
+
+        if (data instanceof ArrayBuffer) {
+          message = new Uint8Array(data);
+        } else if (data instanceof Uint8Array) {
+          message = data;
+        } else if (typeof Buffer !== 'undefined' && Buffer.isBuffer(data)) {
+          // Node.js Buffer (from ws module)
+          message = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        } else if (ArrayBuffer.isView(data)) {
+          // Generic ArrayBufferView (TypedArray or DataView)
+          message = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+        }
+
+        if (message) {
+          if (this.#receiveResolver) {
+            this.#receiveResolver(message);
+            this.#receiveResolver = undefined;
+            this.#receiveRejecter = undefined;
+          } else {
+            this.#receiveQueue.push(message);
+          }
+        } else {
+          this.#receivedError(new TypeError(`Received non-binary message from WebSocket: ${typeof data} ${Object.prototype.toString.call(data)}`));
+        }
       }
     });
 
@@ -82,13 +107,13 @@ class WebSocketTransport implements RpcTransport {
   }
 
   #webSocket: WebSocket;
-  #sendQueue?: string[];  // only if not opened yet
-  #receiveResolver?: (message: string) => void;
+  #sendQueue?: Uint8Array[];  // only if not opened yet
+  #receiveResolver?: (message: Uint8Array) => void;
   #receiveRejecter?: (err: any) => void;
-  #receiveQueue: string[] = [];
+  #receiveQueue: Uint8Array[] = [];
   #error?: any;
 
-  async send(message: string): Promise<void> {
+  async send(message: Uint8Array): Promise<void> {
     if (this.#sendQueue === undefined) {
       this.#webSocket.send(message);
     } else {
@@ -97,13 +122,13 @@ class WebSocketTransport implements RpcTransport {
     }
   }
 
-  async receive(): Promise<string> {
+  async receive(): Promise<Uint8Array> {
     if (this.#receiveQueue.length > 0) {
       return this.#receiveQueue.shift()!;
     } else if (this.#error) {
       throw this.#error;
     } else {
-      return new Promise<string>((resolve, reject) => {
+      return new Promise<Uint8Array>((resolve, reject) => {
         this.#receiveResolver = resolve;
         this.#receiveRejecter = reject;
       });
