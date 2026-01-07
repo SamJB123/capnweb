@@ -516,6 +516,9 @@ class RpcSessionImpl implements Importer, Exporter {
       return;
     }
 
+    // Pre-process message to encode PropertyPaths at known locations
+    msg = this.encodePathsInMessage(msg);
+
     let msgData: Uint8Array;
     try {
       msgData = this.codec.encode(msg);
@@ -530,6 +533,224 @@ class RpcSessionImpl implements Importer, Exporter {
         // If send fails, abort the connection, but don't try to send an abort message since
         // that'll probably also fail.
         .catch(err => this.abort(err, false));
+  }
+
+  // Recursively encodes PropertyPaths in a message at known locations.
+  // Paths appear in: ["pipeline", id, path, args?] and ["remap", id, path, captures, instructions]
+  private encodePathsInMessage(msg: any): any {
+    if (!(msg instanceof Array)) return msg;
+
+    // Handle top-level message types
+    switch (msg[0]) {
+      case "push":
+        // ["push", expression] - expression can contain paths
+        if (msg.length > 1) {
+          return ["push", this.encodePathsInExpression(msg[1])];
+        }
+        break;
+
+      case "resolve":
+        // ["resolve", exportId, value] - value can contain paths in nested expressions
+        if (msg.length > 2) {
+          return ["resolve", msg[1], this.encodePathsInValue(msg[2])];
+        }
+        break;
+
+      case "reject":
+        // ["reject", exportId, error] - error shouldn't contain paths, but process anyway
+        if (msg.length > 2) {
+          return ["reject", msg[1], this.encodePathsInValue(msg[2])];
+        }
+        break;
+
+      case "abort":
+        // ["abort", error] - process the error value
+        if (msg.length > 1) {
+          return ["abort", this.encodePathsInValue(msg[1])];
+        }
+        break;
+    }
+
+    return msg;
+  }
+
+  // Encodes paths in RPC expressions (pipeline, import, export, remap, etc.)
+  private encodePathsInExpression(expr: any): any {
+    if (!(expr instanceof Array) || expr.length === 0) return expr;
+
+    switch (expr[0]) {
+      case "pipeline":
+        // ["pipeline", id, path?, args?]
+        if (expr.length >= 3 && Array.isArray(expr[2])) {
+          const encoded: any[] = [expr[0], expr[1], this.codec.encodePath(expr[2])];
+          if (expr.length >= 4) {
+            // Has args - process them too
+            encoded.push(this.encodePathsInValue(expr[3]));
+          }
+          return encoded;
+        }
+        break;
+
+      case "remap":
+        // ["remap", id, path, captures, instructions]
+        if (expr.length >= 3 && Array.isArray(expr[2])) {
+          return [
+            expr[0],
+            expr[1],
+            this.codec.encodePath(expr[2]),
+            expr[3],  // captures don't contain paths
+            expr[4]   // instructions don't contain user paths
+          ];
+        }
+        break;
+    }
+
+    return expr;
+  }
+
+  // Recursively processes a value to encode paths in any nested expressions
+  private encodePathsInValue(value: any): any {
+    if (!(value instanceof Array)) {
+      if (value instanceof Object) {
+        // Process object properties
+        const result: Record<string, unknown> = {};
+        for (const key in value) {
+          result[key] = this.encodePathsInValue(value[key]);
+        }
+        return result;
+      }
+      return value;
+    }
+
+    // Check if this is an expression array
+    if (value.length > 0 && typeof value[0] === "string") {
+      switch (value[0]) {
+        case "pipeline":
+        case "remap":
+          return this.encodePathsInExpression(value);
+
+        case "import":
+        case "export":
+        case "promise":
+          // These don't contain paths
+          return value;
+      }
+    }
+
+    // Check for escaped array: [[...]]
+    // The RPC format wraps literal arrays in a single-element outer array
+    if (value.length === 1 && value[0] instanceof Array) {
+      // Process the inner array contents, keeping the escape wrapper intact
+      return [this.encodePathsInValue(value[0])];
+    }
+
+    // Regular array of values
+    return value.map((item: any) => this.encodePathsInValue(item));
+  }
+
+  // Recursively decodes PropertyPaths in a received message.
+  private decodePathsInMessage(msg: any): any {
+    if (!(msg instanceof Array)) return msg;
+
+    switch (msg[0]) {
+      case "push":
+        if (msg.length > 1) {
+          return ["push", this.decodePathsInExpression(msg[1])];
+        }
+        break;
+
+      case "resolve":
+        if (msg.length > 2) {
+          return ["resolve", msg[1], this.decodePathsInValue(msg[2])];
+        }
+        break;
+
+      case "reject":
+        if (msg.length > 2) {
+          return ["reject", msg[1], this.decodePathsInValue(msg[2])];
+        }
+        break;
+
+      case "abort":
+        if (msg.length > 1) {
+          return ["abort", this.decodePathsInValue(msg[1])];
+        }
+        break;
+    }
+
+    return msg;
+  }
+
+  // Decodes paths in RPC expressions
+  private decodePathsInExpression(expr: any): any {
+    if (!(expr instanceof Array) || expr.length === 0) return expr;
+
+    switch (expr[0]) {
+      case "pipeline":
+        // ["pipeline", id, encodedPath?, args?]
+        if (expr.length >= 3) {
+          const path = this.codec.decodePath(expr[2]);
+          const decoded: any[] = [expr[0], expr[1], path];
+          if (expr.length >= 4) {
+            decoded.push(this.decodePathsInValue(expr[3]));
+          }
+          return decoded;
+        }
+        break;
+
+      case "remap":
+        // ["remap", id, encodedPath, captures, instructions]
+        if (expr.length >= 3) {
+          return [
+            expr[0],
+            expr[1],
+            this.codec.decodePath(expr[2]),
+            expr[3],
+            expr[4]
+          ];
+        }
+        break;
+    }
+
+    return expr;
+  }
+
+  // Recursively decodes paths in values
+  private decodePathsInValue(value: any): any {
+    if (!(value instanceof Array)) {
+      if (value instanceof Object) {
+        const result: Record<string, unknown> = {};
+        for (const key in value) {
+          result[key] = this.decodePathsInValue(value[key]);
+        }
+        return result;
+      }
+      return value;
+    }
+
+    // Check if this is an expression array
+    if (value.length > 0 && typeof value[0] === "string") {
+      switch (value[0]) {
+        case "pipeline":
+        case "remap":
+          return this.decodePathsInExpression(value);
+
+        case "import":
+        case "export":
+        case "promise":
+          return value;
+      }
+    }
+
+    // Check for escaped array: [[...]]
+    // The RPC format wraps literal arrays in a single-element outer array
+    if (value.length === 1 && value[0] instanceof Array) {
+      // Process the inner array contents, keeping the escape wrapper intact
+      return [this.decodePathsInValue(value[0])];
+    }
+
+    // Regular array
+    return value.map((item: any) => this.decodePathsInValue(item));
   }
 
   sendCall(id: ImportId, path: PropertyPath, args?: RpcPayload): RpcImportHook {
@@ -651,6 +872,8 @@ class RpcSessionImpl implements Importer, Exporter {
     while (!this.abortReason) {
       let msgData = await Promise.race([this.transport.receive(), abortPromise]);
       let msg = this.codec.decode(msgData);
+      // Decode any PropertyPath references in the message
+      msg = this.decodePathsInMessage(msg);
       if (this.abortReason) break;  // check again before processing
 
       if (msg instanceof Array) {

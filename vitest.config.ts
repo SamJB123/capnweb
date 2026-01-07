@@ -16,7 +16,7 @@ export default defineConfig({
       {
         test: {
           name: 'node',
-          include: ['__tests__/index.test.ts'],
+          include: ['__tests__/index.test.ts', '__tests__/propertypath.test.ts', '__tests__/signature-features.test.ts', '__tests__/extreme-map.test.ts'],
           environment: 'node',
         },
       },

@@ -3,11 +3,13 @@
 //     https://opensource.org/license/mit
 
 import { expect, it, describe, inject } from "vitest"
-import { cborCodec, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
+import { cborCodec, CborCodec, RpcSession, type RpcSessionOptions, RpcTransport, RpcTarget,
          RpcStub, newWebSocketRpcSession, newMessagePortRpcSession,
          newHttpBatchRpcSession} from "../src/index.js"
 import { Devaluator, Evaluator } from "../src/serialize.js"
-import { Counter, TestTarget } from "./test-util.js";
+import { RpcPayload, PayloadStubHook } from "../src/core.js"
+import { Counter, TestTarget } from "./test-util.js"
+import { Encoder, Decoder, FLOAT32_OPTIONS } from "cbor-x"
 
 // Test cases for CBOR serialization roundtrip
 let SERIALIZE_TEST_CASES: unknown[] = [
@@ -137,15 +139,6 @@ class TestTransport implements RpcTransport {
   public log = false;
 
   async send(message: Uint8Array): Promise<void> {
-    // HACK: If the string "$remove$" appears in the message, remove it. This is used in some
-    //   tests to hack the RPC protocol. We decode, manipulate, and re-encode.
-    const decoded = cborCodec.decode(message) as unknown;
-    const jsonStr = JSON.stringify(decoded);
-    if (jsonStr.includes("$remove$")) {
-      const modified = JSON.parse(jsonStr.replaceAll("$remove$", ""));
-      message = cborCodec.encode(modified);
-    }
-
     if (this.log) console.log(`${this.name}: ${JSON.stringify(cborCodec.decode(message))}`);
     this.partner!.queue.push(message);
     if (this.partner!.waiter) {
@@ -632,70 +625,126 @@ describe("basic rpc", () => {
     );
   });
 
+  /**
+   * Verifies that Object.prototype properties (toString, hasOwnProperty, etc.) and other
+   * dangerous properties (__proto__, constructor) cannot be accessed on RpcTarget objects
+   * through the RPC property access mechanism. This prevents prototype pollution and
+   * information disclosure vulnerabilities.
+   */
   it("does not expose common Object properties on RpcTarget", async () => {
-    await using harness = new TestHarness(new TestTarget());
-    let stub: any = harness.stub;
+    const target = new TestTarget();
+    const payload = RpcPayload.fromAppReturn(target);
+    const hook = new PayloadStubHook(payload);
 
-    // For this test we want to access properties on a remove object that are common properties of
-    // all objects. However, if we just access them on the stub, we'll actually access the *local*
-    // object's version of that property. We really want to generate messages sent to the other
-    // end to access the remote version, but there's no legitimate way to do this via the JS-level
-    // API. Fortunately, our transport implements a hack: the string "$remove$" will be excised
-    // from any message. So, we can use this as a prefix on property names to create a property
-    // that does not match anything locally, but by the time it reaches the remote end, will name
-    // a common object property.
+    const dangerousProperties = [
+      "toString",
+      "hasOwnProperty",
+      "valueOf",
+      "toLocaleString",
+      "isPrototypeOf",
+      "propertyIsEnumerable",
+      "__proto__",
+      "constructor",
+    ];
 
-    // Properties of Object.prototype should not be exposed over RPC.
-    expect(await stub.$remove$toString).toBe(undefined);
-    expect(await stub.$remove$hasOwnProperty).toBe(undefined);
-
-    // Special properties are not exposed.
-    expect(await stub.$remove$__proto__).toBe(undefined);
-    expect(await stub.$remove$constructor).toBe(undefined);
-  });
-
-  it("does not expose common Object properties on RpcTarget", async () => {
-    class ObjectVendor extends RpcTarget {
-      get() {
-        return new RpcStub<object>({
-          foo: 123,
-          arr: [1, 2],
-          func(x: any) { return `${x}`; },
-          jsonify(x: any) { return JSON.stringify(x); },
-          toString() { return "special string"; }
-        });
-      }
+    for (const prop of dangerousProperties) {
+      const resultHook = hook.get([prop]);
+      const resultPayload = await resultHook.pull();
+      expect(resultPayload.value, `property "${prop}" should not be exposed`).toBe(undefined);
+      resultPayload.dispose();
+      resultHook.dispose();
     }
 
-    await using harness = new TestHarness(new ObjectVendor(), {
-      onSendError(err) { return err; }
-    });
-    using stub: any = await harness.stub.get();
+    hook.dispose();
+  });
 
-    expect(await stub.foo).toBe(123);
-    expect(await stub.func(321)).toBe("321");
+  /**
+   * Verifies that Object.prototype properties, Array.prototype properties, and Function.prototype
+   * properties are not exposed on plain objects passed through RPC. Also verifies that dangerous
+   * properties in incoming data are stripped during deserialization to prevent prototype pollution.
+   */
+  it("does not expose common Object properties on plain objects", async () => {
+    const obj = {
+      foo: 123,
+      arr: [1, 2, 3],
+      func(x: any) { return `${x}`; },
+    };
+    const payload = RpcPayload.fromAppReturn(obj);
+    const hook = new PayloadStubHook(payload);
 
-    // Similar to previous test case, but we're operating on a stub backed by an object rather
-    // than an RpcTarget now.
+    // Regular properties should work
+    let resultHook = hook.get(["foo"]);
+    let resultPayload = await resultHook.pull();
+    expect(resultPayload.value).toBe(123);
+    resultPayload.dispose();
+    resultHook.dispose();
 
-    // Properties of Object.prototype should not be exposed over RPC.
-    expect(await stub.$remove$toString).toBe(undefined);
-    expect(await stub.$remove$hasOwnProperty).toBe(undefined);
+    // Object.prototype properties should not be exposed
+    for (const prop of ["toString", "hasOwnProperty", "__proto__", "constructor"]) {
+      resultHook = hook.get([prop]);
+      resultPayload = await resultHook.pull();
+      expect(resultPayload.value, `property "${prop}" should not be exposed`).toBe(undefined);
+      resultPayload.dispose();
+      resultHook.dispose();
+    }
 
-    // Properties of Array.prototype and Function.prototype are similarly not exposed even for
-    // values of those types.
-    expect(await stub.arr.$remove$map).toBe(undefined);
-    expect(await stub.func.$remove$call).toBe(undefined);
+    // Array.prototype properties should not be exposed on nested arrays
+    resultHook = hook.get(["arr", "map"]);
+    resultPayload = await resultHook.pull();
+    expect(resultPayload.value, `Array.prototype.map should not be exposed`).toBe(undefined);
+    resultPayload.dispose();
+    resultHook.dispose();
 
-    // Special properties are not exposed.
-    expect(await stub.$remove$__proto__).toBe(undefined);
-    expect(await stub.$remove$constructor).toBe(undefined);
+    // Function.prototype properties should not be exposed on nested functions
+    resultHook = hook.get(["func", "call"]);
+    resultPayload = await resultHook.pull();
+    expect(resultPayload.value, `Function.prototype.call should not be exposed`).toBe(undefined);
+    resultPayload.dispose();
+    resultHook.dispose();
 
-    expect(await stub.func({})).toBe("[object Object]");
-    expect(await stub.func({$remove$toString: "bad"})).toBe("[object Object]");
-    expect(await stub.func({$remove$__proto__: {toString: "bad"}})).toBe("[object Object]");
+    hook.dispose();
+  });
 
-    expect(await stub.jsonify({x: 123, $remove$toJSON: () => "bad"})).toBe('{"x":123}');
+  /**
+   * Verifies that dangerous properties are stripped from incoming deserialized data during
+   * the evaluation phase. This prevents prototype pollution attacks where a malicious peer
+   * sends objects with __proto__, constructor, toString, or toJSON properties.
+   */
+  it("strips dangerous properties from deserialized objects", () => {
+    // Simulate receiving data from a malicious peer with dangerous properties
+    const maliciousData = {
+      safe: "value",
+      nested: { also: "safe" },
+      toString: "malicious",
+      hasOwnProperty: "malicious",
+      __proto__: { bad: true },
+      constructor: "malicious",
+      toJSON: "malicious",
+    };
+
+    // NullImporter since we're not testing stub import functionality
+    class NullImporter {
+      importStub() { throw new Error("not implemented"); }
+      importPromise() { throw new Error("not implemented"); }
+      getExport() { return undefined; }
+    }
+
+    const evaluator = new Evaluator(new NullImporter());
+    const payload = evaluator.evaluate(maliciousData);
+    const result = payload.value as Record<string, unknown>;
+
+    // Safe properties should be preserved
+    expect(result.safe).toBe("value");
+    expect((result.nested as any).also).toBe("safe");
+
+    // Dangerous properties should be stripped (using hasOwn to check own properties, not prototype)
+    expect(Object.hasOwn(result, "toString")).toBe(false);
+    expect(Object.hasOwn(result, "hasOwnProperty")).toBe(false);
+    expect(Object.hasOwn(result, "__proto__")).toBe(false);
+    expect(Object.hasOwn(result, "constructor")).toBe(false);
+    expect(Object.hasOwn(result, "toJSON")).toBe(false);
+
+    payload.dispose();
   });
 
   it("supports passing async functinos", async () => {
@@ -1476,8 +1525,6 @@ describe("WebSockets", () => {
 // =======================================================================================
 
 describe("CBOR message size comparison", () => {
-  // Import cbor-x directly for comparison tests
-  const { Encoder, FLOAT32_OPTIONS } = require('cbor-x');
 
   // Simulated RPC message structures
   const positionUpdate = ["call", 1, 0, "updatePosition", [{ x: 12.456, y: 0.5, z: -8.234, rotation: 1.57 }]];
@@ -1643,6 +1690,334 @@ describe("CBOR message size comparison", () => {
 
 // =======================================================================================
 
+describe("Shared structures mode (sequential: false)", () => {
+  it("requires shared structures array between encoder and decoder", () => {
+    // This test demonstrates why structures must be shared when sequential: false
+    const sharedStructures: object[] = [];
+
+    const encoder = new Encoder({
+      sequential: false,
+      useRecords: true,
+      structures: sharedStructures,
+    });
+
+    const decoder = new Decoder({
+      sequential: false,
+      useRecords: true,
+      structures: sharedStructures,  // Same array - this is required!
+    });
+
+    const obj = { name: "Alice", age: 30 };
+    const encoded = encoder.encode(obj);
+    const decoded = decoder.decode(encoded);
+
+    expect(decoded).toStrictEqual(obj);
+  });
+
+  it("fails gracefully when structures are not shared", () => {
+    // Demonstrates what happens without shared structures
+    const encoderStructures: object[] = [];
+    const decoderStructures: object[] = [];
+
+    const encoder = new Encoder({
+      sequential: false,
+      useRecords: true,
+      structures: encoderStructures,
+    });
+
+    const decoder = new Decoder({
+      sequential: false,
+      useRecords: true,
+      structures: decoderStructures,  // Different array - problematic!
+    });
+
+    const obj = { name: "Alice", age: 30 };
+    const encoded = encoder.encode(obj);
+    const decoded = decoder.decode(encoded);
+
+    // Decoder returns a Tag object when it can't resolve the structure
+    expect(decoded).toHaveProperty('tag');
+    expect(decoded).toHaveProperty('value');
+  });
+
+  it("CborCodec handles shared structures correctly in non-sequential mode", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    // Test various data types
+    const testCases = [
+      { name: "Alice", age: 30 },
+      { x: 1.5, y: 2.5, z: 3.5 },
+      { nested: { deep: { value: 42 } } },
+      [{ id: 1 }, { id: 2 }, { id: 3 }],
+    ];
+
+    for (const original of testCases) {
+      const encoded = codec.encode(original);
+      const decoded = codec.decode(encoded);
+      expect(decoded).toStrictEqual(original);
+    }
+  });
+
+  it("learns structures incrementally and reuses them", () => {
+    const structures: object[] = [];
+
+    const encoder = new Encoder({
+      sequential: false,
+      useRecords: true,
+      structures: structures,
+    });
+
+    const decoder = new Decoder({
+      sequential: false,
+      useRecords: true,
+      structures: structures,
+    });
+
+    // First encode - creates structure
+    const obj1 = { x: 1, y: 2 };
+    const encoded1 = encoder.encode(obj1);
+    expect(structures.length).toBeGreaterThan(0);
+    const structuresAfterFirst = structures.length;
+
+    // Second encode with same shape - reuses structure
+    const obj2 = { x: 10, y: 20 };
+    const encoded2 = encoder.encode(obj2);
+    expect(structures.length).toBe(structuresAfterFirst);  // No new structures
+
+    // Third encode with different shape - creates new structure
+    const obj3 = { a: 1, b: 2, c: 3 };
+    encoder.encode(obj3);
+    expect(structures.length).toBeGreaterThan(structuresAfterFirst);
+
+    // All decode correctly
+    expect(decoder.decode(encoded1)).toStrictEqual(obj1);
+    expect(decoder.decode(encoded2)).toStrictEqual(obj2);
+  });
+
+  it("produces smaller messages than sequential mode for independent streams", () => {
+    // The key benefit of shared structures mode: structures persist across the
+    // lifetime of a connection. Sequential mode is designed for streams where
+    // the decoder might start reading mid-stream, so each encode could be
+    // independent.
+    //
+    // This test simulates the real-world scenario: multiple independent message
+    // sends. With shared structures, the structure is learned once. With
+    // sequential mode (fresh encoder each time), each message must embed the
+    // structure definition.
+
+    const sharedStructures: object[] = [];
+    const sharedEncoder = new Encoder({
+      sequential: false,
+      useRecords: true,
+      structures: sharedStructures,
+    });
+
+    const obj = { type: "position", x: 12.5, y: 0.5, z: -8.5, rotation: 1.57 };
+
+    // Warm up shared structures with first message
+    sharedEncoder.encode(obj);
+
+    // Now simulate 5 messages
+    let sharedTotal = 0;
+    let sequentialTotal = 0;
+
+    for (let i = 0; i < 5; i++) {
+      const msg = { ...obj, x: i * 10 };
+
+      // Shared mode: reuses the same encoder with learned structures
+      sharedTotal += sharedEncoder.encode(msg).length;
+
+      // Sequential mode: fresh encoder each time (simulating independent streams)
+      const freshSequentialEncoder = new Encoder({
+        sequential: true,
+        useRecords: true,
+      });
+      sequentialTotal += freshSequentialEncoder.encode(msg).length;
+    }
+
+    // Shared structures should use significantly less bandwidth
+    // because it doesn't re-embed structure definitions
+    expect(sharedTotal).toBeLessThan(sequentialTotal);
+  });
+
+  it("handles complex nested structures", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const complex = {
+      user: {
+        id: 123,
+        profile: {
+          name: "Alice",
+          settings: {
+            theme: "dark",
+            notifications: true,
+          },
+        },
+      },
+      metadata: {
+        created: 1234567890,
+        tags: ["important", "reviewed"],
+      },
+    };
+
+    const encoded = codec.encode(complex);
+    const decoded = codec.decode(encoded);
+    expect(decoded).toStrictEqual(complex);
+  });
+
+  it("handles arrays of objects with consistent structure", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const items = [
+      { id: 1, name: "Item 1", price: 10.99 },
+      { id: 2, name: "Item 2", price: 20.99 },
+      { id: 3, name: "Item 3", price: 30.99 },
+    ];
+
+    const encoded = codec.encode(items);
+    const decoded = codec.decode(encoded);
+    expect(decoded).toStrictEqual(items);
+  });
+
+  it("handles mixed primitive and object values", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const mixed = {
+      string: "hello",
+      number: 42,
+      float: 3.14,
+      boolean: true,
+      null: null,
+      array: [1, 2, 3],
+      nested: { key: "value" },
+    };
+
+    const encoded = codec.encode(mixed);
+    const decoded = codec.decode(encoded);
+    expect(decoded).toStrictEqual(mixed);
+  });
+
+  it("handles empty and single-key objects", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    // Empty object
+    const empty = {};
+    expect(codec.decode(codec.encode(empty))).toStrictEqual(empty);
+
+    // Single key
+    const single = { only: "one" };
+    expect(codec.decode(codec.encode(single))).toStrictEqual(single);
+  });
+
+  it("handles objects with many keys", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const manyKeys: Record<string, number> = {};
+    for (let i = 0; i < 50; i++) {
+      manyKeys[`key${i}`] = i;
+    }
+
+    const encoded = codec.encode(manyKeys);
+    const decoded = codec.decode(encoded);
+    expect(decoded).toStrictEqual(manyKeys);
+  });
+
+  it("maintains structure consistency across many encode/decode cycles", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const template = { type: "event", timestamp: 0, data: { value: 0 } };
+
+    // Encode/decode many variations
+    for (let i = 0; i < 100; i++) {
+      const obj = {
+        ...template,
+        timestamp: Date.now() + i,
+        data: { value: Math.random() },
+      };
+
+      const encoded = codec.encode(obj);
+      const decoded = codec.decode(encoded);
+      expect(decoded).toStrictEqual(obj);
+    }
+  });
+
+  it("handles special number values", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const special = {
+      infinity: Infinity,
+      negInfinity: -Infinity,
+      // NaN requires special handling in tests since NaN !== NaN
+    };
+
+    const encoded = codec.encode(special);
+    const decoded = codec.decode(encoded) as typeof special;
+    expect(decoded.infinity).toBe(Infinity);
+    expect(decoded.negInfinity).toBe(-Infinity);
+
+    // Test NaN separately
+    const withNaN = { value: NaN };
+    const decodedNaN = codec.decode(codec.encode(withNaN)) as typeof withNaN;
+    expect(Number.isNaN(decodedNaN.value)).toBe(true);
+  });
+
+  it("handles Uint8Array values", () => {
+    const codec = new CborCodec({ sequential: false });
+
+    const data = {
+      binary: new Uint8Array([1, 2, 3, 4, 5]),
+      label: "binary data",
+    };
+
+    const encoded = codec.encode(data);
+    const decoded = codec.decode(encoded) as typeof data;
+    expect(decoded.label).toBe("binary data");
+    expect(decoded.binary).toBeInstanceOf(Uint8Array);
+    expect(Array.from(decoded.binary)).toStrictEqual([1, 2, 3, 4, 5]);
+  });
+
+  it("compares message sizes: shared structures vs sequential for repeated structures", () => {
+    const sharedStructures: object[] = [];
+    const sharedEncoder = new Encoder({
+      sequential: false,
+      useRecords: true,
+      structures: sharedStructures,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    const sequentialEncoder = new Encoder({
+      sequential: true,
+      useRecords: true,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    const message = { type: "update", x: 1.5, y: 2.5, z: 3.5, timestamp: 12345 };
+
+    // Warm up shared structures
+    sharedEncoder.encode(message);
+
+    // Now compare sizes for 10 messages
+    let sharedTotal = 0;
+    let sequentialTotal = 0;
+
+    for (let i = 0; i < 10; i++) {
+      const msg = { ...message, timestamp: 12345 + i };
+      sharedTotal += sharedEncoder.encode(msg).length;
+      sequentialTotal += sequentialEncoder.encode(msg).length;
+    }
+
+    console.log("\nShared structures vs Sequential (10 messages after warmup):");
+    console.log(`  Shared structures: ${sharedTotal} bytes`);
+    console.log(`  Sequential:        ${sequentialTotal} bytes`);
+    console.log(`  Shared is ${((sequentialTotal - sharedTotal) / sequentialTotal * 100).toFixed(1)}% smaller`);
+
+    // After warmup, shared mode should be more efficient
+    expect(sharedTotal).toBeLessThan(sequentialTotal);
+  });
+});
+
+// =======================================================================================
+
 describe("MessagePorts", () => {
   it("can communicate over MessageChannel", async () => {
     // Create a MessageChannel for communication
@@ -1702,5 +2077,221 @@ describe("MessagePorts", () => {
     // Wait for the client to detect the broken connection
     await expect(() => brokenPromise).rejects.toThrow(
         new Error("Peer closed MessagePort connection."));
+  });
+});
+
+// =======================================================================================
+
+describe("PropertyPath reference caching", () => {
+  /**
+   * Verifies that PropertyPath encoding and decoding correctly roundtrips paths.
+   */
+  it("correctly encodes and decodes paths", () => {
+    const codec = new CborCodec();
+
+    const testPaths = [
+      ["foo"],
+      ["foo", "bar"],
+      ["foo", "bar", "baz"],
+      ["items", 0],
+      ["items", 0, "name"],
+      ["deeply", "nested", "path", "to", "value"],
+    ];
+
+    for (const path of testPaths) {
+      const encoded = codec.encodePath(path);
+      const decoded = codec.decodePath(encoded);
+      expect(decoded).toStrictEqual(path);
+    }
+  });
+
+  /**
+   * Verifies that empty paths are handled correctly and not cached
+   * (since they're cheap to encode directly).
+   */
+  it("handles empty paths without caching", () => {
+    const codec = new CborCodec();
+
+    // Empty paths should always return a definition with _pd: -1
+    const encoded1 = codec.encodePath([]);
+    const encoded2 = codec.encodePath([]);
+
+    expect(encoded1).toHaveProperty("_pd", -1);
+    expect(encoded1).toHaveProperty("p");
+    expect(encoded2).toHaveProperty("_pd", -1);
+    expect(encoded2).toHaveProperty("p");
+
+    // Both should decode to empty array
+    expect(codec.decodePath(encoded1)).toStrictEqual([]);
+    expect(codec.decodePath(encoded2)).toStrictEqual([]);
+  });
+
+  /**
+   * Verifies that the first occurrence of a path returns a definition,
+   * and subsequent occurrences return a reference.
+   */
+  it("returns definition on first use, reference on subsequent uses", () => {
+    const codec = new CborCodec();
+
+    const path = ["users", "profile", "name"];
+
+    // First encode should return a definition
+    const first = codec.encodePath(path);
+    expect(first).toHaveProperty("_pd");
+    expect(first).toHaveProperty("p");
+    expect((first as any).p).toStrictEqual(path);
+
+    // Second encode should return a reference
+    const second = codec.encodePath(path);
+    expect(second).toHaveProperty("_pr");
+    expect(second).not.toHaveProperty("p");
+
+    // Both should decode to the same path
+    expect(codec.decodePath(first)).toStrictEqual(path);
+    expect(codec.decodePath(second)).toStrictEqual(path);
+  });
+
+  /**
+   * Verifies that different paths get different IDs.
+   */
+  it("assigns different IDs to different paths", () => {
+    const codec = new CborCodec();
+
+    const path1 = ["foo", "bar"];
+    const path2 = ["foo", "baz"];
+    const path3 = ["qux"];
+
+    const enc1 = codec.encodePath(path1) as any;
+    const enc2 = codec.encodePath(path2) as any;
+    const enc3 = codec.encodePath(path3) as any;
+
+    // All should be definitions with unique IDs
+    expect(enc1._pd).toBe(0);
+    expect(enc2._pd).toBe(1);
+    expect(enc3._pd).toBe(2);
+
+    // Encoding the same paths again should return references
+    expect(codec.encodePath(path1)).toStrictEqual({ _pr: 0 });
+    expect(codec.encodePath(path2)).toStrictEqual({ _pr: 1 });
+    expect(codec.encodePath(path3)).toStrictEqual({ _pr: 2 });
+  });
+
+  /**
+   * Verifies that paths with numeric indices (for array access) work correctly.
+   */
+  it("handles paths with numeric indices", () => {
+    const codec = new CborCodec();
+
+    const path = ["items", 0, "children", 2, "name"];
+    const encoded = codec.encodePath(path);
+    const decoded = codec.decodePath(encoded);
+
+    expect(decoded).toStrictEqual(path);
+    expect(typeof decoded[1]).toBe("number");
+    expect(typeof decoded[3]).toBe("number");
+  });
+
+  /**
+   * Verifies that decoding an unknown reference throws an error.
+   */
+  it("throws error for unknown path reference", () => {
+    const codec = new CborCodec();
+
+    expect(() => codec.decodePath({ _pr: 999 })).toThrow("Unknown path reference: 999");
+  });
+
+  /**
+   * Verifies backwards compatibility: raw arrays are accepted as paths.
+   */
+  it("accepts raw arrays for backwards compatibility", () => {
+    const codec = new CborCodec();
+
+    const rawPath = ["foo", "bar"];
+    const decoded = codec.decodePath(rawPath);
+
+    expect(decoded).toStrictEqual(rawPath);
+  });
+
+  /**
+   * Benchmarks the size savings from PropertyPath reference caching.
+   * Shows that repeated paths are encoded much more compactly.
+   */
+  it("demonstrates size savings from path caching", () => {
+    const codec = new CborCodec();
+
+    // Simulate a typical RPC scenario: many calls to the same method path
+    const methodPath = ["users", "profile", "updateSettings"];
+
+    // First call: full definition
+    const firstEncoded = codec.encode({
+      type: "call",
+      path: codec.encodePath(methodPath),
+      args: { theme: "dark" }
+    });
+
+    // Subsequent calls: just a reference
+    const subsequentEncoded = codec.encode({
+      type: "call",
+      path: codec.encodePath(methodPath),
+      args: { theme: "light" }
+    });
+
+    console.log("\nPropertyPath caching size comparison:");
+    console.log(`  First call (with path definition): ${firstEncoded.length} bytes`);
+    console.log(`  Subsequent call (path reference):  ${subsequentEncoded.length} bytes`);
+    console.log(`  Savings per subsequent call: ${firstEncoded.length - subsequentEncoded.length} bytes`);
+
+    // The subsequent message should be smaller because it uses a reference instead of the full path
+    expect(subsequentEncoded.length).toBeLessThan(firstEncoded.length);
+  });
+
+  /**
+   * Benchmarks cumulative savings over many repeated path uses.
+   */
+  it("shows cumulative savings over many calls", () => {
+    const codec = new CborCodec();
+
+    const paths = [
+      ["users", "get"],
+      ["users", "update"],
+      ["users", "profile", "get"],
+      ["items", "list"],
+      ["items", "create"],
+    ];
+
+    // Simulate 100 RPC calls, each using one of the paths
+    let totalWithCaching = 0;
+    let totalWithoutCaching = 0;
+
+    for (let i = 0; i < 100; i++) {
+      const path = paths[i % paths.length];
+      const args = { requestId: i };
+
+      // With caching
+      const withCaching = codec.encode({
+        type: "call",
+        path: codec.encodePath(path),
+        args
+      });
+      totalWithCaching += withCaching.length;
+
+      // Without caching (always send full path)
+      const withoutCaching = codec.encode({
+        type: "call",
+        path: { _pd: -1, p: path }, // Always send as definition
+        args
+      });
+      totalWithoutCaching += withoutCaching.length;
+    }
+
+    const savings = ((totalWithoutCaching - totalWithCaching) / totalWithoutCaching * 100).toFixed(1);
+
+    console.log("\nPropertyPath caching over 100 calls (5 unique paths):");
+    console.log(`  With caching:    ${totalWithCaching} bytes`);
+    console.log(`  Without caching: ${totalWithoutCaching} bytes`);
+    console.log(`  Savings: ${savings}%`);
+
+    // Should see meaningful savings
+    expect(totalWithCaching).toBeLessThan(totalWithoutCaching);
   });
 });

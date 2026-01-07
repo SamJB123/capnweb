@@ -2,7 +2,34 @@
 // Licensed under the MIT license found in the LICENSE.txt file or at:
 //     https://opensource.org/license/mit
 
-import { Encoder, Decoder, FLOAT32_OPTIONS } from 'cbor-x'
+import { Encoder, Decoder } from 'cbor-x'
+import type { PropertyPath } from './core.js'
+
+// Path reference format: first occurrence sends definition, subsequent send reference
+// Definition: { _pd: id, p: path } - defines and uses path
+// Reference: { _pr: id } - references previously defined path
+type PathDefinition = { _pd: number; p: PropertyPath }
+type PathReference = { _pr: number }
+
+function isPathDefinition(value: unknown): value is PathDefinition {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'_pd' in value &&
+		'p' in value &&
+		typeof (value as PathDefinition)._pd === 'number' &&
+		Array.isArray((value as PathDefinition).p)
+	)
+}
+
+function isPathReference(value: unknown): value is PathReference {
+	return (
+		typeof value === 'object' &&
+		value !== null &&
+		'_pr' in value &&
+		typeof (value as PathReference)._pr === 'number'
+	)
+}
 
 /**
  * CBOR codec for Cap'n Web RPC messages.
@@ -16,17 +43,32 @@ import { Encoder, Decoder, FLOAT32_OPTIONS } from 'cbor-x'
  * - 15-50% smaller messages for repeated object shapes
  * - No manual structure coordination between encoder/decoder
  *
+ * Additionally implements PropertyPath reference caching:
+ * - First occurrence of a path sends the full definition with an ID
+ * - Subsequent occurrences send only a compact reference
+ * - Typically reduces path encoding from 15-30 bytes to 3-5 bytes
+ *
  * IMPORTANT: Each RPC session should create its own CborCodec instance to
  * maintain proper structure state. The singleton `cborCodec` is only for
- * standalone/testing use and does NOT use sequential mode.
+ * standalone/testing use.
  */
 export class CborCodec {
 	private encoder: Encoder
 	private decoder: Decoder
-	// Separate structures arrays for encoder and decoder
-	// Each maintains its own state for the structures it has seen
+	// Structures array for record encoding/decoding.
+	// When sequential: true, encoder and decoder can use separate arrays because
+	// structure definitions are embedded inline in the stream.
+	// When sequential: false, encoder and decoder MUST share the same array
+	// so the decoder can look up structures that the encoder defined.
 	private encoderStructures: object[] = []
 	private decoderStructures: object[] = []
+
+	// PropertyPath reference caching
+	// Encoder side: maps stringified path to assigned ID
+	private encodePathRegistry = new Map<string, number>()
+	// Decoder side: maps ID to path (array index = ID)
+	private decodePathRegistry: PropertyPath[] = []
+	private nextPathId = 0
 
 	constructor(options: { sequential?: boolean } = {}) {
 		// With sequential mode (default), maxSharedStructures is automatically set to 0,
@@ -37,20 +79,78 @@ export class CborCodec {
 		// the record format.
 		const sequential = options.sequential ?? true
 
+		// When not using sequential mode, share the structures array between
+		// encoder and decoder so that structure IDs resolve correctly.
+		const sharedStructures = sequential ? undefined : this.encoderStructures
+
 		this.encoder = new Encoder({
 			sequential,
 			useRecords: true,
 			encodeUndefinedAsNil: false,
 			tagUint8Array: true,
-			useFloat32: FLOAT32_OPTIONS.ALWAYS,
-			structures: this.encoderStructures,
+			structures: sharedStructures ?? this.encoderStructures,
 		})
 
 		this.decoder = new Decoder({
 			sequential,
 			useRecords: true,
-			structures: this.decoderStructures,
+			structures: sharedStructures ?? this.decoderStructures,
 		})
+	}
+
+	/**
+	 * Encodes a PropertyPath, using reference caching for repeated paths.
+	 * First occurrence: returns { _pd: id, p: path } (definition)
+	 * Subsequent: returns { _pr: id } (reference)
+	 */
+	encodePath(path: PropertyPath): PathDefinition | PathReference {
+		// Empty paths are common and cheap, don't bother caching
+		if (path.length === 0) {
+			return { _pd: -1, p: path }
+		}
+
+		const key = JSON.stringify(path)
+		const existingId = this.encodePathRegistry.get(key)
+
+		if (existingId !== undefined) {
+			// Path already registered, send reference
+			return { _pr: existingId }
+		}
+
+		// New path, assign ID and send definition
+		const id = this.nextPathId++
+		this.encodePathRegistry.set(key, id)
+		return { _pd: id, p: path }
+	}
+
+	/**
+	 * Decodes a PropertyPath from either a definition or reference.
+	 * Definitions are registered for future reference lookups.
+	 */
+	decodePath(value: unknown): PropertyPath {
+		if (isPathDefinition(value)) {
+			// It's a definition - register it (unless it's the empty path marker)
+			if (value._pd >= 0) {
+				this.decodePathRegistry[value._pd] = value.p
+			}
+			return value.p
+		}
+
+		if (isPathReference(value)) {
+			// It's a reference - look it up
+			const path = this.decodePathRegistry[value._pr]
+			if (path === undefined) {
+				throw new Error(`Unknown path reference: ${value._pr}`)
+			}
+			return path
+		}
+
+		// For backwards compatibility, also accept raw arrays
+		if (Array.isArray(value)) {
+			return value as PropertyPath
+		}
+
+		throw new Error(`Invalid path encoding: ${JSON.stringify(value)}`)
 	}
 
 	encode(value: unknown): Uint8Array {
@@ -66,6 +166,6 @@ export class CborCodec {
 }
 
 // Singleton instance for standalone/testing use.
-// Uses sequential: false for compatibility with independent encode/decode calls.
-// RPC sessions create their own CborCodec instances with sequential: true.
-export const cborCodec = new CborCodec({ sequential: false })
+// Uses sequential: true (the default) which embeds structure definitions inline,
+// making it compatible with independent encode/decode calls and matching RPC session behavior.
+export const cborCodec = new CborCodec()

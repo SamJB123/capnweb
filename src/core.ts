@@ -1696,15 +1696,23 @@ class PromiseStubHook extends StubHook {
   }
 
   dispose(): void {
-    if (this.resolution) {
-      this.resolution.dispose();
-    } else {
-      this.promise.then(hook => {
-        hook.dispose();
-      }, err => {
-        // nothing to dispose
-      });
-    }
+    // Schedule disposal via .then() to ensure it runs AFTER all other pending callbacks.
+    // This is critical because when the promise resolves, the constructor's .then() sets
+    // this.resolution, but other callbacks (from get(), call(), map()) may still be queued.
+    // If we disposed synchronously (or scheduled before other callbacks), those callbacks
+    // would receive a disposed hook.
+    //
+    // By always using .then(), disposal runs after:
+    // 1. The constructor's resolution-setting callback
+    // 2. Any other callbacks that were scheduled before dispose() was called
+    this.promise.then(hook => {
+      hook.dispose();
+    }, () => {
+      // Promise rejected - if resolution was set before rejection, dispose it
+      if (this.resolution) {
+        this.resolution.dispose();
+      }
+    });
   }
 
   onBroken(callback: (error: any) => void): void {
