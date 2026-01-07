@@ -4,7 +4,7 @@
 
 import { StubHook, RpcPayload, RpcStub, PropertyPath, PayloadStubHook, ErrorStubHook, RpcTarget, unwrapStubAndPath } from "./core.js";
 import { Devaluator, Evaluator, ExportId, ImportId, Exporter, Importer } from "./serialize.js";
-import { cborCodec } from "./codec.js";
+import { CborCodec } from "./codec.js";
 
 /**
  * Interface for an RPC transport, which is a simple bidirectional message stream. Implement this
@@ -308,6 +308,10 @@ class RpcSessionImpl implements Importer, Exporter {
   private abortReason?: any;
   private cancelReadLoop: (error: any) => void;
 
+  // Per-session CBOR codec. Each session needs its own encoder/decoder pair
+  // to maintain structure state for sequential mode.
+  private codec = new CborCodec();
+
   // We assign positive numbers to imports we initiate, and negative numbers to exports we
   // initiate. So the next import ID is just `imports.length`, but the next export ID needs
   // to be tracked explicitly.
@@ -514,7 +518,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     let msgData: Uint8Array;
     try {
-      msgData = cborCodec.encode(msg);
+      msgData = this.codec.encode(msg);
     } catch (err) {
       // If CBOR encoding failed, there's something wrong with the devaluator, as it should
       // not allow non-encodable values to be injected in the first place.
@@ -597,7 +601,7 @@ class RpcSessionImpl implements Importer, Exporter {
 
     if (trySendAbortMessage) {
       try {
-        this.transport.send(cborCodec.encode(["abort", Devaluator
+        this.transport.send(this.codec.encode(["abort", Devaluator
             .devaluate(error, undefined, this)]))
             .catch(err => {});
       } catch (err) {
@@ -646,7 +650,7 @@ class RpcSessionImpl implements Importer, Exporter {
   private async readLoop(abortPromise: Promise<never>) {
     while (!this.abortReason) {
       let msgData = await Promise.race([this.transport.receive(), abortPromise]);
-      let msg = cborCodec.decode(msgData);
+      let msg = this.codec.decode(msgData);
       if (this.abortReason) break;  // check again before processing
 
       if (msg instanceof Array) {

@@ -1473,6 +1473,176 @@ describe("WebSockets", () => {
   });
 });
 
+// =======================================================================================
+
+describe("CBOR message size comparison", () => {
+  // Import cbor-x directly for comparison tests
+  const { Encoder, FLOAT32_OPTIONS } = require('cbor-x');
+
+  // Simulated RPC message structures
+  const positionUpdate = ["call", 1, 0, "updatePosition", [{ x: 12.456, y: 0.5, z: -8.234, rotation: 1.57 }]];
+  const simpleCall = ["call", 1, 0, "square", [5]];
+  const complexReturn = ["return", 5, {
+    user: { id: 123, name: "Alice", roles: ["admin", "user"] },
+    profile: { bio: "Developer", location: "SF" }
+  }];
+
+  it("sequential mode: first message includes structure, subsequent messages reference it", () => {
+    const encoder = new Encoder({
+      sequential: true,
+      useRecords: true,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    // Encode position update multiple times
+    const sizes: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const encoded = encoder.encode(positionUpdate);
+      sizes.push(encoded.length);
+    }
+
+    console.log("Sequential mode (useRecords: true) - position update sizes:", sizes);
+
+    // First message should be larger (includes structure definition)
+    expect(sizes[0]).toBeGreaterThan(sizes[1]);
+
+    // Subsequent messages should all be the same size
+    expect(sizes[1]).toBe(sizes[2]);
+    expect(sizes[2]).toBe(sizes[3]);
+    expect(sizes[3]).toBe(sizes[4]);
+
+    // Subsequent messages should be significantly smaller
+    const savings = ((sizes[0] - sizes[1]) / sizes[0] * 100).toFixed(1);
+    console.log(`  First message: ${sizes[0]} bytes, subsequent: ${sizes[1]} bytes (${savings}% smaller)`);
+  });
+
+  it("useRecords: false - all messages same size (no structure reuse)", () => {
+    const encoder = new Encoder({
+      useRecords: false,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    // Encode position update multiple times
+    const sizes: number[] = [];
+    for (let i = 0; i < 5; i++) {
+      const encoded = encoder.encode(positionUpdate);
+      sizes.push(encoded.length);
+    }
+
+    console.log("No records mode (useRecords: false) - position update sizes:", sizes);
+
+    // All messages should be the same size (no structure learning)
+    expect(sizes[0]).toBe(sizes[1]);
+    expect(sizes[1]).toBe(sizes[2]);
+  });
+
+  it("compares sequential vs no-records for repeated structures", () => {
+    const sequentialEncoder = new Encoder({
+      sequential: true,
+      useRecords: true,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    const noRecordsEncoder = new Encoder({
+      useRecords: false,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    // Encode 10 position updates
+    let sequentialTotal = 0;
+    let noRecordsTotal = 0;
+
+    for (let i = 0; i < 10; i++) {
+      sequentialTotal += sequentialEncoder.encode(positionUpdate).length;
+      noRecordsTotal += noRecordsEncoder.encode(positionUpdate).length;
+    }
+
+    console.log("\n10 position updates comparison:");
+    console.log(`  Sequential (useRecords: true):  ${sequentialTotal} bytes total`);
+    console.log(`  No records (useRecords: false): ${noRecordsTotal} bytes total`);
+    console.log(`  Savings with records: ${((noRecordsTotal - sequentialTotal) / noRecordsTotal * 100).toFixed(1)}%`);
+
+    // Sequential mode should use less total bytes for repeated structures
+    expect(sequentialTotal).toBeLessThan(noRecordsTotal);
+  });
+
+  it("compares JSON vs CBOR for typical RPC messages", () => {
+    const encoder = new Encoder({
+      sequential: true,
+      useRecords: true,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    const testCases = [
+      { name: "Position update", data: positionUpdate },
+      { name: "Simple call", data: simpleCall },
+      { name: "Complex return", data: complexReturn },
+    ];
+
+    console.log("\nJSON vs CBOR comparison (first encode, includes structure):");
+
+    for (const { name, data } of testCases) {
+      const jsonSize = new TextEncoder().encode(JSON.stringify(data)).length;
+      const cborSize = encoder.encode(data).length;
+      const savings = ((jsonSize - cborSize) / jsonSize * 100).toFixed(1);
+
+      console.log(`  ${name}: JSON ${jsonSize}B vs CBOR ${cborSize}B (${savings}% ${cborSize < jsonSize ? 'smaller' : 'larger'})`);
+    }
+
+    // Re-encode the same structures (now they're learned)
+    console.log("\nJSON vs CBOR comparison (subsequent encode, structure reference only):");
+
+    for (const { name, data } of testCases) {
+      const jsonSize = new TextEncoder().encode(JSON.stringify(data)).length;
+      const cborSize = encoder.encode(data).length;
+      const savings = ((jsonSize - cborSize) / jsonSize * 100).toFixed(1);
+
+      console.log(`  ${name}: JSON ${jsonSize}B vs CBOR ${cborSize}B (${savings}% ${cborSize < jsonSize ? 'smaller' : 'larger'})`);
+    }
+  });
+
+  it("high-frequency update simulation (100 position updates)", () => {
+    const sequentialEncoder = new Encoder({
+      sequential: true,
+      useRecords: true,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    const noRecordsEncoder = new Encoder({
+      useRecords: false,
+      useFloat32: FLOAT32_OPTIONS.ALWAYS,
+    });
+
+    // Simulate 100 position updates (like 5 seconds at 20Hz)
+    const updates = Array.from({ length: 100 }, (_, i) =>
+      ["call", 1, 0, "pos", [{ x: Math.random() * 20, y: 0.5, z: Math.random() * 20, r: Math.random() * 6.28 }]]
+    );
+
+    let sequentialTotal = 0;
+    let noRecordsTotal = 0;
+    let jsonTotal = 0;
+
+    for (const update of updates) {
+      sequentialTotal += sequentialEncoder.encode(update).length;
+      noRecordsTotal += noRecordsEncoder.encode(update).length;
+      jsonTotal += new TextEncoder().encode(JSON.stringify(update)).length;
+    }
+
+    console.log("\n100 position updates (5 seconds @ 20Hz):");
+    console.log(`  JSON:                          ${jsonTotal} bytes (${(jsonTotal / 1024).toFixed(2)} KB)`);
+    console.log(`  CBOR (no records):             ${noRecordsTotal} bytes (${(noRecordsTotal / 1024).toFixed(2)} KB)`);
+    console.log(`  CBOR (sequential + records):   ${sequentialTotal} bytes (${(sequentialTotal / 1024).toFixed(2)} KB)`);
+    console.log(`  Savings vs JSON:               ${((jsonTotal - sequentialTotal) / jsonTotal * 100).toFixed(1)}%`);
+    console.log(`  Savings vs no-records:         ${((noRecordsTotal - sequentialTotal) / noRecordsTotal * 100).toFixed(1)}%`);
+
+    // Sequential with records should be smallest
+    expect(sequentialTotal).toBeLessThan(noRecordsTotal);
+    expect(sequentialTotal).toBeLessThan(jsonTotal);
+  });
+});
+
+// =======================================================================================
+
 describe("MessagePorts", () => {
   it("can communicate over MessageChannel", async () => {
     // Create a MessageChannel for communication
